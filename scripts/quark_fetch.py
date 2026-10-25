@@ -28,10 +28,13 @@ import time
 import urllib.parse
 import urllib.request
 
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 "
+      "Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch")
 API = "https://drive-pc.quark.cn"
 PROBE_NAME = "winrar-x64-700scp.exe"
+PROXY = None   # --proxy 传入，形如 http://127.0.0.1:7890
+LOCAL = False  # --local 直接下载到 ./downloads/ 而不上传 Release
 
 
 def log(msg):
@@ -110,11 +113,15 @@ class UrlBox:
         return self.url
 
 
-def curl_dl(url, out, rng=None, max_bytes=None, max_time=1800):
-    """下载到文件，返回 HTTP 状态码（412=CDN 封锁）"""
+def curl_dl(url, out, rng=None, max_bytes=None, max_time=1800, resume=False):
+    """下载到文件，返回 HTTP 状态码（412=CDN 封锁）。resume=True 时追加写入"""
     cmd = ["curl", "-sSL", "--retry", "5", "--retry-delay", "3", "--retry-all-errors",
            "--speed-time", "60", "--speed-limit", "20480",
            "-A", UA, "-e", "https://pan.quark.cn/"]
+    if PROXY:
+        cmd += ["-x", PROXY]
+    if resume:
+        cmd += ["-C", "-"]
     if rng:
         cmd += ["-r", rng]
     if max_bytes:
@@ -171,10 +178,12 @@ def probe_run(box, tag):
 
 def head_probe(url):
     """探测 Range 支持与文件总大小，返回 (total, range_supported, http_code)"""
-    r = subprocess.run(
-        ["curl", "-sS", "-r", "bytes=0-1048575", "--max-filesize", "2097152",
-         "-D", "-", "-o", "/dev/null", "-A", UA, "-e", "https://pan.quark.cn/", url],
-        capture_output=True, text=True, timeout=180)
+    cmd = ["curl", "-sS", "-r", "bytes=0-1048575", "--max-filesize", "2097152",
+           "-D", "-", "-o", "/dev/null", "-A", UA, "-e", "https://pan.quark.cn/"]
+    if PROXY:
+        cmd += ["-x", PROXY]
+    cmd.append(url)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     text = r.stdout or ""
     code = re.findall(r"HTTP/[\d.]+ (\d+)", text)
     code = code[-1] if code else "000"
@@ -188,30 +197,46 @@ def head_probe(url):
 
 
 def download_chunked(box, tag, total, chunk, parallel):
-    """Range 分块并行下载 + 边下边传 + 断点续传"""
+    """Range 分块并行下载。--local 模式存 ./downloads/（支持断点续传），否则边下边传 Release"""
     n = (total + chunk - 1) // chunk
     prefix = os.path.basename(box.item["path"])
-    existing = ensure_release(tag, "quark-relay 中继下载")
+    if LOCAL:
+        os.makedirs("downloads", exist_ok=True)
+        existing = set(os.listdir("downloads"))
+    else:
+        existing = ensure_release(tag, "quark-relay 中继下载")
     todo = [i for i in range(n) if f"{prefix}.part{i:03d}" not in existing]
-    log(f"总分块 {n}（每块 {chunk//1024//1024}MB），已完成 {n - len(todo)}，本次待下 {len(todo)}")
+    log(f"总分块 {n}（每块 {chunk//1024//1024}MB），已完成 {n - len(todo)}，本次待下 {len(todo)}"
+        + (" [local 模式]" if LOCAL else ""))
 
     def work(i):
         part = f"{prefix}.part{i:03d}"
-        tmp = f"/tmp/{part}"
+        if LOCAL:
+            tmp = os.path.join("downloads", part)
+            # 断点续传：已下部分调整 Range 起点
+            have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        else:
+            tmp = f"/tmp/{part}"
+            have = 0
         start, end = i * chunk, min((i + 1) * chunk, total) - 1
         want = end - start + 1
         for attempt in range(8):
             try:
                 url = box.url
-                code, err = curl_dl(url, tmp, rng=f"bytes={start}-{end}",
-                                    max_bytes=want + 1048576)
+                rng = f"bytes={start + have}-{end}" if have else f"bytes={start}-{end}"
+                code, err = curl_dl(url, tmp, rng=rng,
+                                    max_bytes=want - have + 1048576, resume=bool(have))
                 if code == "200" and os.path.exists(tmp) and os.path.getsize(tmp) > want + 1048576:
                     os.remove(tmp)
                     raise RuntimeError("服务端忽略 Range 返回全文")
                 if code in ("200", "206") and os.path.exists(tmp) and os.path.getsize(tmp) == want:
-                    upload_asset(tag, tmp)
-                    os.remove(tmp)
-                    log(f"块 {i:03d}/{n - 1} 完成并上传 ({want:,} bytes)")
+                    if LOCAL:
+                        log(f"块 {i:03d}/{n - 1} 完成并存盘 ({want:,} bytes)")
+                    else:
+                        upload_asset(tag, tmp)
+                        log(f"块 {i:03d}/{n - 1} 完成并上传 ({want:,} bytes)")
+                    if not LOCAL:
+                        os.remove(tmp)
                     return
                 log(f"块 {i:03d} 第 {attempt + 1} 次重试（HTTP {code}）")
                 box.refresh()
@@ -227,7 +252,11 @@ def download_chunked(box, tag, total, chunk, parallel):
     if todo:
         with cf.ThreadPoolExecutor(max_workers=parallel) as ex:
             list(ex.map(work, todo))
-    log("全部分块下载并上传完成")
+    if LOCAL:
+        log(f"✅ 全部分块已存盘到 downloads/。拼接命令：")
+        log(f"   cat downloads/{prefix}.part* > {prefix}")
+    else:
+        log("全部分块下载并上传完成")
 
 
 def download_stream(box, tag, chunk):
@@ -236,7 +265,10 @@ def download_stream(box, tag, chunk):
     os.makedirs("/tmp/parts", exist_ok=True)
     ensure_release(tag, "quark-relay 中继下载（流式模式）")
     cmd = ["curl", "-sSL", "--retry", "10", "--retry-delay", "5", "--retry-all-errors",
-           "-A", UA, "-e", "https://pan.quark.cn/", box.url]
+           "-A", UA, "-e", "https://pan.quark.cn/"]
+    if PROXY:
+        cmd += ["-x", PROXY]
+    cmd.append(box.url)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     i, got = 0, 0
 
@@ -275,7 +307,12 @@ def main():
     ap.add_argument("--url-only", action="store_true", help="只申请直链并打印")
     ap.add_argument("--chunk-mb", type=int, default=1800)
     ap.add_argument("--parallel", type=int, default=3)
+    ap.add_argument("--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890（走代理直连下载）")
+    ap.add_argument("--local", action="store_true", help="本地模式：分块存 ./downloads/，不上传 Release")
     a = ap.parse_args()
+
+    global PROXY, LOCAL
+    PROXY, LOCAL = a.proxy, a.local
 
     m = re.search(r"/s/([0-9A-Za-z]+)", a.share_url)
     if not m:
