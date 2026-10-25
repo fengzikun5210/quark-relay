@@ -1,0 +1,14 @@
+name: quark-relay
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/quark_fetch.py --probe
+      - run: python3 scripts/quark_fetch.py
